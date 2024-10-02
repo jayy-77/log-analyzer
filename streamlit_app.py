@@ -29,7 +29,7 @@ def parse_log_line(line):
 def analyze_uploaded_log(file):
     log_data_list = []
     with open(file, 'r') as f:
-        next(f)  # Skip header line
+        next(f) 
         for line in f:
             if line.strip():
                 parsed_line = parse_log_line(line)
@@ -43,7 +43,6 @@ def analyze_uploaded_log(file):
         log_df = log_df.drop(['Date', 'Time'], axis=1)
         log_df['Size'] = pd.to_numeric(log_df['Size'], errors='coerce')
 
-        # Analysis Functions
         action_counts = log_df['Action'].value_counts()
         top_blocked_ports = log_df[log_df['Action'] == 'BLOCK']['Dst_Port'].value_counts().head(10)
         suspicious_ips = log_df[log_df['Action'] == 'BLOCK']['Src_IP'].value_counts().head(10)
@@ -72,11 +71,9 @@ st.title("Firewall Log Analyzer")
 uploaded_file = st.file_uploader("Upload your firewall log", type="log")
 
 if uploaded_file is not None and allowed_file(uploaded_file.name):
-    # Save the uploaded log
     with open(os.path.join(UPLOAD_FOLDER, 'uploaded.log'), 'wb') as f:
         f.write(uploaded_file.getbuffer())
 
-    # Analyze the log file
     log_df, action_counts, blocked_ports, suspicious_ips, ddos_attempts, brute_force_attempts = analyze_uploaded_log(os.path.join(UPLOAD_FOLDER, 'uploaded.log'))
     
     if log_df is not None:
