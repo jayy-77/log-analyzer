@@ -1,107 +1,107 @@
-import streamlit as st
+"""Streamlit UI — now a thin client of the log_analyzer package.
+
+The original 100-line script that mixed parsing, training and UI is gone.
+This file is just glue: parse log → call the training / batch-score CLIs
+under the hood → render charts.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
-import os, re, joblib
-from sklearn.ensemble import IsolationForest
+import streamlit as st
 
-UPLOAD_FOLDER = 'logs'
-ALLOWED_EXTENSIONS = {'log'}
+from log_analyzer.data import load_log_file
+from log_analyzer.features import build_feature_pipeline, FEATURE_NAMES
+from log_analyzer.models import get_model
+from log_analyzer.monitoring.drift import report_drift
+from log_analyzer.training import train_model
+from log_analyzer.training.train import TrainConfig
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+UPLOAD_FOLDER = Path("logs")
+UPLOAD_FOLDER.mkdir(exist_ok=True)
 
-def parse_log_line(line):
-    fields = re.split(r' +', line.strip())
-    if len(fields) < 11:
-        return None
+st.set_page_config(page_title="Firewall Anomaly ML", layout="wide")
+st.title("Firewall Anomaly Detection — MLE Pipeline")
 
-    log_data = {
-        'Date': fields[0],
-        'Time': fields[1],
-        'Action': fields[2],
-        'Protocol': fields[3],
-        'Src_IP': fields[4],
-        'Dst_IP': fields[5],
-        'Src_Port': fields[6] if fields[6] != '-' else None,
-        'Dst_Port': fields[7] if fields[7] != '-' else None,
-        'Size': fields[8] if fields[8] != '-' else None,
-        'TCP_Flags': fields[9] if fields[9] != '-' else None,
-        'Info': " ".join(fields[10:])
-    }
+with st.sidebar:
+    st.header("Configuration")
+    model_name = st.selectbox(
+        "Model",
+        options=["isolation_forest", "one_class_svm", "autoencoder"],
+        index=0,
+    )
+    contamination = st.slider("Contamination / nu", 0.01, 0.20, 0.05)
+    threshold = st.slider("Anomaly threshold", 0.0, 1.0, 0.7)
+    n_train = st.number_input("Synthetic train samples", 1_000, 100_000, 10_000)
+    st.caption("Threshold applies to scores returned by .score() (0–1 calibrated).")
 
-    return log_data
+uploaded_file = st.file_uploader("Upload a firewall log", type=["log"])
 
-def analyze_uploaded_log(file):
-    log_data_list = []
-    with open(file, 'r') as f:
-        next(f)
-        for line in f:
-            if line.strip():
-                parsed_line = parse_log_line(line)
-                if parsed_line:
-                    log_data_list.append(parsed_line)
-    
-    log_df = pd.DataFrame(log_data_list).dropna(how='all')
+if uploaded_file is None:
+    st.info("Upload a .log file (ABC Inc. column format).")
+    st.stop()
 
-    if not log_df.empty:
-        log_df['DateTime'] = pd.to_datetime(log_df['Date'] + ' ' + log_df['Time'], errors='coerce')
-        log_df = log_df.drop(['Date', 'Time'], axis=1)
+target = UPLOAD_FOLDER / "uploaded.log"
+target.write_bytes(uploaded_file.getbuffer())
 
-        log_df['Size'] = pd.to_numeric(log_df['Size'], errors='coerce')
+batch = load_log_file(target)
+st.success(f"Parsed {batch.parsed:,} entries ({batch.rejected:,} rejected)")
+if not batch.entries:
+    st.error("No parseable entries in the uploaded file.")
+    st.stop()
 
-        action_counts = log_df['Action'].value_counts()
-        top_blocked_ports = log_df[log_df['Action'] == 'BLOCK']['Dst_Port'].value_counts().head(10)
-        suspicious_ips = log_df[log_df['Action'] == 'BLOCK']['Src_IP'].value_counts().head(10)
+df = pd.DataFrame([e.model_dump() for e in batch.entries])
 
-        return log_df, action_counts, top_blocked_ports, suspicious_ips
-    else:
-        return None, None, None, None
+st.subheader("Sample")
+st.dataframe(df.head(10))
 
-def train_ai_model(log_df):
-    features = log_df[['Src_Port', 'Dst_Port', 'Size']].fillna(0).astype(float)
-    model = IsolationForest(contamination=0.1, random_state=42)
-    model.fit(features)
-    joblib.dump(model, 'anomaly_detection_model.pkl')
+col1, col2, col3 = st.columns(3)
+col1.metric("Records", len(df))
+col2.metric("BLOCK rate", f"{(df['action'] == 'BLOCK').mean():.1%}")
+col3.metric("Unique src IPs", df["src_ip"].nunique())
 
-def detect_anomalies(log_df):
-    model = joblib.load('anomaly_detection_model.pkl')
-    features = log_df[['Src_Port', 'Dst_Port', 'Size']].fillna(0).astype(float)
-    log_df['Anomaly'] = model.predict(features)
-    return log_df[log_df['Anomaly'] == -1] 
+with st.spinner(f"Training {model_name} on synthetic data and scoring uploaded logs..."):
+    cfg = TrainConfig(
+        model_name=model_name,
+        n_train=int(n_train),
+        contamination=contamination,
+        artifact_path="artifacts/streamlit_model.joblib",
+    )
+    train_model(cfg)
 
-st.title("AI-Powered Firewall Log Analyzer")
+    from log_analyzer.models.registry import load_model
 
-uploaded_file = st.file_uploader("Upload your firewall log", type="log")
+    model = load_model(cfg.artifact_path).model
+    pipeline = load_model(Path(cfg.artifact_path).with_suffix(".pipeline.joblib")).model
 
-if uploaded_file is not None and allowed_file(uploaded_file.name):
-    with open(os.path.join(UPLOAD_FOLDER, 'uploaded.log'), 'wb') as f:
-        f.write(uploaded_file.getbuffer())
+    X = pipeline.transform(df)
+    scores = model.score(np.asarray(X))
+    df["score"] = scores
+    df["decision"] = (scores >= threshold).astype(int)
 
-    log_df, action_counts, blocked_ports, suspicious_ips = analyze_uploaded_log(os.path.join(UPLOAD_FOLDER, 'uploaded.log'))
-    
-    if log_df is not None:
-        st.subheader("Log Data Overview")
-        st.write(log_df.head())
+st.subheader("Anomaly scores")
+st.bar_chart(pd.Series(scores).rename("score"))
 
-        st.subheader("Action Counts")
-        st.bar_chart(action_counts)
+st.subheader("Top suspected anomalies")
+top = df.sort_values("score", ascending=False).head(25)
+st.dataframe(top[["timestamp", "action", "src_ip", "dst_ip", "dst_port", "size", "score", "decision"]])
 
-        st.subheader("Top Blocked Ports")
-        st.bar_chart(blocked_ports)
+st.subheader("Action breakdown")
+st.bar_chart(df["action"].value_counts())
 
-        st.subheader("Suspicious IPs (Blocked)")
-        st.bar_chart(suspicious_ips)
+st.subheader("Top blocked destination ports")
+st.bar_chart(df[df["action"] == "BLOCK"]["dst_port"].value_counts().head(10))
 
-        train_ai_model(log_df)
-        
-        anomalies = detect_anomalies(log_df)
+with st.expander("Drift report vs. synthetic baseline"):
+    from log_analyzer.data import SyntheticLogGenerator
 
-        if not anomalies.empty:
-            st.subheader("Detected Anomalies (Potential Threats)")
-            st.write(anomalies)
-        else:
-            st.write("No anomalies detected.")
-
-    else:
-        st.error("Failed to parse log data.")
-else:
-    st.info("Please upload a valid .log file")
+    gen = SyntheticLogGenerator()
+    gen.config.anomaly_ratio = 0.0
+    base = pd.DataFrame([e.model_dump() for e in gen.generate(5_000)])
+    X_base = np.asarray(pipeline.transform(base))
+    reports = report_drift(list(FEATURE_NAMES), X_base, np.asarray(X))
+    st.dataframe(pd.DataFrame([r.__dict__ for r in reports]))
